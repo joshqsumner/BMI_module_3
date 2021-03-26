@@ -1,0 +1,278 @@
+---
+title: "Something something"
+author: "Josh Sumner"
+subtitle: ''
+always_allow_html: true
+output:
+  pdf_document:
+    highlight: tango
+    number_sections: no
+    toc: yes
+    toc_depth: '4'
+  html_document:
+    code_folding: hide
+    highlight: textmate
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+    toc_depth: 4
+    toc_float: no
+  word_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, comment = "")
+knitr::include_graphics
+
+library(DT)
+library(tidyverse)
+library(RColorBrewer)
+library(scales)
+library(grDevices)
+library(survival)
+library(survminer)
+library(KMsurv)
+library(ggfortify)
+library(lubridate)
+library(broom)
+library(cmprsk)
+library(cowplot)
+library(condsurv)
+
+theme_set(theme_minimal() +
+  theme(axis.line.y.left = element_line(),
+        axis.line.x.bottom = element_line()))
+#spColors<-c(brewer.pal(7, "Dark2"))
+#swColors<-c(brewer.pal(12, "Paired"))
+
+`%not_in%` <- purrr::negate(`%in%`)
+```
+
+```{r, eval=F}
+#install packages that failed with install.packages("NAME") 
+#if condsurv fails, use this block
+library(remotes)
+remotes::install_github("zabore/condsurv")
+```
+
+
+## Read in Strokes 4
+
+
+```{r}
+df<-read_csv("strokes_4.csv")
+
+colnames(df)<-str_to_lower(str_replace_all(colnames(df), "\\s|-", "_"))
+colnames(df)<-str_replace_all(colnames(df),"reference_event", "stroke_1")
+dim(df)
+colnames(df)
+```
+
+
+```{r}
+df%>%
+  group_by(chd_condition)%>%
+  summarize(n())
+```
+
+
+```{r}
+df$count_censored<-apply(df,1,function(x) 
+            sum(sapply("censored", function(codes) grepl("censored",x))))
+```
+
+```{r}
+list<-apply(df,2,function(x) 
+            sum(sapply("censored", function(codes) grepl("censored",x))))
+sort(list, decreasing=T)%>%
+  head(5)
+```
+
+```{r}
+nonCens4 <-df%>%
+  filter(count_censored ==0,
+         !is.na(bmi_average_calculated_bmi))
+nrow(nonCens4)
+```
+
+```{r}
+df%>%
+  mutate(stroke_2_condition_raw = ifelse(is.na(stroke_2_condition), "None", stroke_2_condition))%>%
+  group_by(stroke_2_condition_raw)%>%
+  summarize(prop=paste0(100*round(n()/nrow(df), digits=4),"%"))
+
+nonCens4%>%
+  mutate(stroke_2_condition_cleaned = ifelse(is.na(stroke_2_condition), "None", stroke_2_condition))%>%
+  group_by(stroke_2_condition_cleaned)%>%
+  summarize(prop=paste0(100*round(n()/nrow(nonCens4), digits=4),"%"))
+```
+
+This is more acceptable censoring effect, with censoring and empty BMI values removed I am within 2% of original event rate.
+
+```{r}
+df%>%
+  filter(!is.na(bmi_average_calculated_bmi))%>%
+  nrow()
+```
+
+what columns do I need to make?
+
+Time of first stroke: 0
+
+Time from first stroke to EVENT (first of embolism, death, stroke_2)
+
+EVENT code (0 = censor, 1 = stroke_2/embolism, 2 = competing_death)
+
+
+```{r, warning=T}
+clean<-nonCens4%>%
+  rowwise()%>%
+  mutate(TIME = round(min(c(stroke_2_condition_start_date_days_from_reference, death_date_of_death_days_from_reference, c_embolism_condition_start_date_days_from_reference), na.rm=T), 4))%>%
+  mutate(TIME = ifelse(TIME == Inf, 7049, TIME))%>%
+  mutate(status = 
+    ifelse(!is.na(death_date_of_death_days_from_reference) &
+          TIME==round(death_date_of_death_days_from_reference, 4) , 2, #death
+    ifelse(!is.na(stroke_2_condition_start_date_days_from_reference) &
+          TIME==round(stroke_2_condition_start_date_days_from_reference, 4) , 1, #stroke
+    ifelse(!is.na(c_embolism_condition_start_date_days_from_reference) &
+          TIME==round(c_embolism_condition_start_date_days_from_reference, 4) , 1, #stroke
+    0))))%>% #censoring
+  rename(ref_age = stroke_1_age_at_event,
+         bmi = bmi_average_calculated_bmi,
+         stroke_2_time = stroke_2_condition_start_date_days_from_reference,
+         death_time = death_date_of_death_days_from_reference,
+         embolism_time = c_embolism_condition_start_date_days_from_reference)%>%
+  mutate(across(
+    .cols = contains("days_from_reference"),
+    .fns = ~ ifelse(is.na(.),0, 1),
+    .names = str_replace_all("{col}", "start_date_days_from_reference", "binary")))%>%
+  mutate(across(
+    .cols = contains("_time"),
+    .fns = ~ ifelse(is.na(.), 7049, .)))%>%
+  mutate(BMI = ifelse(bmi < 18.5, "Underweight", 
+                      ifelse(18.5 <= bmi & bmi < 25, "Normal",
+                             ifelse(25 <= bmi & bmi < 30, "Overweight", "Obese"))))
+
+colnames(clean)<-str_replace_all(colnames(clean), "start_date_days_from_reference", "binary")
+
+clean<-clean%>%
+  filter(primary_race %in% c("Black", "White"))%>%
+  select(TIME, status, primary_race, ref_age, BMI, stroke_2_condition, stroke_2_time, death_time, bmi, hypertension_admission_binary, embolism_time, ace_inhib_order_binary, diuretics_order_binary, beta_blockers_order_binary, cc_blocker_order_binary, arb_order_binary, chd_condition_binary, count_censored,  chd_condition)%>%
+  ungroup()
+
+head(clean)
+```
+
+Censoring codes:
+status = 0 : censored
+status = 1 : stroke
+status = 2 : Death by competing risk
+
+
+```{r}
+clean%>%
+  filter(TIME <7049)%>% #missing value time
+  summarize(maxDays = (max(TIME)))#/30.4)/12)
+```
+
+
+So, following these people for 20 years after their first stroke will do fine.
+
+
+## Competing Risk Regression
+
+```{r}
+nrow(clean)
+```
+
+
+```{r}
+ci_fit<-cuminc(ftime = clean$TIME,
+               fstatus = clean$status, #event 1 = stroke , event 2 = CR
+               group = clean$primary_race,
+               cencode = 0)
+ci_fit
+ci_fit[["Tests"]]
+
+ggcompetingrisks(
+  fit = ci_fit, 
+  multiple_panels = FALSE,
+  xlab = "Days",
+  ylab = "Cumulative incidence of Events",
+  title = "Stroke vs Death",
+  ylim = c(0, 1)
+)
+```
+
+```{r}
+ciplotdat <- 
+  ci_fit %>% 
+  list_modify("Tests" = NULL) %>% 
+  map_df(`[`, c("time", "est"), .id = "id")%>% 
+  mutate(id = recode(
+    id, 
+    "Black 1" = "Black:Stroke", 
+    "Black 2" = "Black:Death", 
+    "White 1" = "White:Stroke",
+    "White 2" = "White:Death")
+    ) %>% 
+  separate(id, c("Group", "Event"), ":") 
+
+
+ggplot(ciplotdat, aes(x = time, y = est, color = Group)) +
+  geom_step(aes(linetype = Event), size = 0.5)  +
+  ylim(c(0, 1))+
+  labs(x = "Days", 
+       y = "Cumulative incidence",
+       title = "Stroke/Death by Race") +
+  annotate("text", x = 0, y = 1, hjust = 0,
+           label = paste0(
+             "Stroke p = ", 
+             ifelse(ci_fit$Tests[1, 2] < .001, 
+                    "<.001", 
+                    round(ci_fit$Tests[1, 2], 3)))) + 
+  annotate("text", x = 0, y = 0.92, hjust = 0,
+           label = paste0(
+             "Competing Risk p = ", 
+             ifelse(ci_fit$Tests[2, 2] < .001, 
+                    "<.001", 
+                    round(ci_fit$Tests[2, 2], 3)))) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 14),
+        legend.title = element_blank(),
+        legend.position = "bottom") 
+```
+
+```{r}
+ci_fit$Tests[1, 2]
+```
+
+
+```{r}
+cr_Mod<- cmprsk::crr(
+  ftime= clean$TIME, #time variable
+  fstatus = clean$status, #censoring vs death vs stroke
+  cov1 = clean[, c("primary_race", "ref_age", "BMI")], # matrix of the covariates we care about from our data
+  cencode = 2 # we need to specify that if status == 2 then there person was censored, nomrally this defaults to 0
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
