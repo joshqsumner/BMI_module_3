@@ -71,11 +71,14 @@ colnames(df)
 ```
 
 
+
+
 ```{r}
 df%>%
-  group_by(chd_condition)%>%
-  summarize(n())
+  group_by(primary_race)%>%
+  summarize(n=n())
 ```
+
 
 
 ```{r}
@@ -91,9 +94,26 @@ sort(list, decreasing=T)%>%
 ```
 
 ```{r}
+df%>%
+  mutate(ifelse(count_censored>=1, 1, 0))%>%
+  group_by(count_censored>=1)%>%
+  summarize(n=n())
+```
+
+
+```{r}
+df<-df%>%
+  mutate(across(
+    .cols = everything(), #maybe change this, something like starts_with("malignant"),
+    .fns = ~ str_replace(.,"censored", "missing")
+  ))
+```
+
+
+
+```{r}
 nonCens4 <-df%>%
-  filter(count_censored ==0,
-         !is.na(bmi_average_calculated_bmi))
+  filter(count_censored ==0)
 nrow(nonCens4)
 ```
 
@@ -125,12 +145,35 @@ Time from first stroke to EVENT (first of embolism, death, stroke_2)
 
 EVENT code (0 = censor, 1 = stroke_2/embolism, 2 = competing_death)
 
+```{r}
+colnames(df)
+```
 
-```{r, warning=T}
-clean<-nonCens4%>%
+
+
+
+```{r}
+isNeg<-function(x){ifelse(x < 0, 1, x)}
+
+cleaned<-df%>%
+  rowid_to_column("id")%>%
+  mutate(primary_race = ifelse(grepl("black", primary_race, ignore.case = T), "Black", primary_race))%>%
+  filter(primary_race %in% c("Black", "White"))%>%
   rowwise()%>%
-  mutate(TIME = round(min(c(stroke_2_condition_start_date_days_from_reference, death_date_of_death_days_from_reference, c_embolism_condition_start_date_days_from_reference), na.rm=T), 4))%>%
+  mutate(TIME = ifelse(is.na(stroke_2_condition_start_date_days_from_reference) & 
+                         is.na(death_date_of_death_days_from_reference) &
+                         is.na(c_embolism_condition_start_date_days_from_reference), 
+                      #7049, #what time should be recorded as event time if no event happened? last time we see them.
+                       round(max(c(hypertension_admission_start_date_days_from_reference,
+                           ace_inhib_order_start_date_days_from_reference,
+                           diuretics_order_start_date_days_from_reference,
+                           beta_blockers_order_start_date_days_from_reference,
+                           cc_blocker_order_start_date_days_from_reference,
+                           arb_order_start_date_days_from_reference,
+                           chd_condition_start_date_days_from_reference), na.rm=T), 4),
+                       round(min(c(stroke_2_condition_start_date_days_from_reference, death_date_of_death_days_from_reference, c_embolism_condition_start_date_days_from_reference), na.rm=T), 4)))%>%
   mutate(TIME = ifelse(TIME == Inf, 7049, TIME))%>%
+  mutate(TIME = isNeg(TIME))%>%
   mutate(status = 
     ifelse(!is.na(death_date_of_death_days_from_reference) &
           TIME==round(death_date_of_death_days_from_reference, 4) , 2, #death
@@ -139,6 +182,7 @@ clean<-nonCens4%>%
     ifelse(!is.na(c_embolism_condition_start_date_days_from_reference) &
           TIME==round(c_embolism_condition_start_date_days_from_reference, 4) , 1, #stroke
     0))))%>% #censoring
+  mutate(TIME = ifelse(TIME==0, 0.5, TIME))%>%
   rename(ref_age = stroke_1_age_at_event,
          bmi = bmi_average_calculated_bmi,
          stroke_2_time = stroke_2_condition_start_date_days_from_reference,
@@ -146,33 +190,186 @@ clean<-nonCens4%>%
          embolism_time = c_embolism_condition_start_date_days_from_reference)%>%
   mutate(across(
     .cols = contains("days_from_reference"),
-    .fns = ~ ifelse(is.na(.),0, 1),
-    .names = str_replace_all("{col}", "start_date_days_from_reference", "binary")))%>%
+    .fns = ~ isNeg(.),
+    .names = "{col}_time"))%>%
   mutate(across(
     .cols = contains("_time"),
     .fns = ~ ifelse(is.na(.), 7049, .)))%>%
-  mutate(BMI = ifelse(bmi < 18.5, "Underweight", 
+  mutate(bmi = ifelse(is.na(bmi), median(bmi, na.rm=T), bmi))%>%
+  mutate(BMI = ifelse(is.na(bmi), "missing",
+                      ifelse(bmi < 18.5, "Underweight",
                       ifelse(18.5 <= bmi & bmi < 25, "Normal",
-                             ifelse(25 <= bmi & bmi < 30, "Overweight", "Obese"))))
-
-colnames(clean)<-str_replace_all(colnames(clean), "start_date_days_from_reference", "binary")
-
-clean<-clean%>%
-  filter(primary_race %in% c("Black", "White"))%>%
-  select(TIME, status, primary_race, ref_age, BMI, stroke_2_condition, stroke_2_time, death_time, bmi, hypertension_admission_binary, embolism_time, ace_inhib_order_binary, diuretics_order_binary, beta_blockers_order_binary, cc_blocker_order_binary, arb_order_binary, chd_condition_binary, count_censored,  chd_condition)%>%
+                             ifelse(25 <= bmi & bmi < 30, "Overweight", "Obese")))))%>%
+  mutate(BMI = as.factor(BMI))%>%
+  select(id, race=primary_race, ref_age, bmi, TIME, status, contains("_time"), BMI, stroke_2_condition)%>%
   ungroup()
+  
+colnames(cleaned)<-str_remove_all(colnames(cleaned), "_start_date_days_from_reference_time")
 
-head(clean)
+cleaned<-cleaned%>%
+  mutate(BB = ifelse(beta_blockers_order < TIME, 1, 0),
+         CC = ifelse(cc_blocker_order < TIME, 1, 0),
+         DIU = ifelse(diuretics_order < TIME, 1, 0),
+         ACE = ifelse(ace_inhib_order < TIME, 1, 0),
+         HYP = ifelse(hypertension_admission < TIME, 1, 0),
+         ARB = ifelse(arb_order < TIME, 1, 0),
+         CHD = ifelse(chd_condition < TIME, 1, 0))%>%
+  select(id, ref_age, TIME, status, bmi, BMI, hypertension_admission, HYP, ace_inhib_order, ACE, diuretics_order, DIU, beta_blockers_order, BB, cc_blocker_order, CC, arb_order, ARB, chd_time = chd_condition, CHD, race)
+
+head(cleaned)
+#nrow(cleaned)
 ```
 
-Censoring codes:
+
+
+
+```{r}
+switchBinary<-function(x){-1*(x-1)}
+td<-tmerge(
+    data1 = cleaned %>% select(id, TIME, status, ref_age, BMI, bmi, race), 
+    data2 = cleaned %>% select(id, TIME, status, BB, beta_blockers_order), 
+    id = id, 
+    stroke2 = event(TIME, status),
+    beta = tdc(BB)
+    )
+nrow(td)
+td<-tmerge(
+  data1 = td,
+  data2 = cleaned%>%select(id, TIME, status, CC, cc_blocker_order),
+  id = id,
+  cc = tdc(CC)
+)
+nrow(td)
+td<-tmerge(
+  data1 = td,
+  data2 = cleaned%>%select(id, TIME, status, HYP, hypertension_admission),
+  id = id,
+  hyp = tdc(HYP)
+)
+nrow(td)
+td<-tmerge(
+  data1 = td,
+  data2 = cleaned%>%select(id, TIME, status, ACE, ace_inhib_order),
+  id = id,
+  ace = tdc(ACE)
+)
+nrow(td)
+td<-tmerge(
+  data1 = td,
+  data2 = cleaned%>%select(id, TIME, status, ARB, arb_order),
+  id = id,
+  arb = tdc(ARB)
+)
+nrow(td)
+td<-tmerge(
+  data1 = td,
+  data2 = cleaned%>%select(id, TIME, status, CHD, chd_time),
+  id = id,
+  chd = tdc(CHD)
+)
+td<-td%>%
+  mutate(across(
+    .cols = c(beta, cc, hyp, ace, arb, chd),
+    .fns = ~switchBinary(.)
+  ))
+
+nrow(td)
+head(td)
+```
+
+
+```{r}
+td%>%
+  filter(chd==1)%>%
+  nrow()
+cleaned%>%
+  filter(CHD==1)%>%
+  nrow()
+```
+
+
+```{r}
+tdcxph<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ ref_age+chd + hyp, data = td)
+
+tdcxph %>% broom::tidy(exp=T)
+summary(tdcxph)
+cox.zph(tdcxph)
+```
+
+```{r}
+tdcxph2<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ beta+cc+arb+ace+BMI+race, data = td)
+
+tdcxph2 %>% broom::tidy(exp=T)
+summary(tdcxph2)
+cox.zph(tdcxph2)
+```
+
+```{r}
+tdcxph3<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ ref_age+chd +BMI+race, data = td)
+
+tdcxph3 %>% broom::tidy(exp=T)
+summary(tdcxph3)
+cox.zph(tdcxph3)
+```
+
+These drug details are pretty worthless, I'll probably rebuild a new MD Clone query and see if I can get smoking status without everything getting messed up.
+
+
+`cleaned` Data:
+
+`id`: Row identifier for unique simulated subjects
+
+`ref_age`: Age at first stroke
+
+`TIME`: Time to second stroke in days. When a time was not present this defaults to 7049.
+
+`status`: 
 status = 0 : censored
 status = 1 : stroke
 status = 2 : Death by competing risk
 
+`bmi`: Numeric BMI
+
+`BMI`: Discretized BMI
+Underweight: bmi under 18.5
+Normal: bmi between 18.5 and 25
+Overweight: bmi between 25 and 30
+Obese: bmi over 30
+missing: bmi was not found
+
+`hypertension_admission`: Time of hypertension diagnosis (moved to 1 if diagnosis occured before first stroke)
+
+`HYP`: Binary yes/no (1/0) whether patient was diagnosed with hypertension.
+
+`ace_inhib_order`: Time of ace inhibitor order (moved to 1 if order occured before first stroke)
+
+`ACE`: Binary yes/no (1/0) whether patient has ACE inhibitors at any point before their second stroke.
+
+`diuretics_order`: Time of diuretics order (moved to 1 if order occured before first stroke)
+
+`DIU`: Binary yes/no (1/0) whether patient is on diuretics at any point before their second stroke.
+
+`beta_blockers_order`: Time of beta blockers order (moved to 1 if order occured before first stroke)
+
+`BB`: Binary yes/no (1/0) whether patient is on beta blockers at any point before their second stroke.
+
+`cc_blocker_order`: Time of calcium channel blockers order (moved to 1 if order occured before first stroke)
+
+`CC`: Binary yes/no (1/0) whether patient is on calcium channel blockers at any point before their second stroke.
+
+`arb_order`: Time of agents acting on renin-angiotensin system order (moved to 1 if order occured before first stroke)
+
+`ARB`: Binary yes/no (1/0) whether patient is taking agents acting on the renin-angiotensin system at any point before their second stroke.
+
+`chd_time`: Time of CHD diagnosis (moved to 1 if order occured before first stroke)
+
+`CHD`: Binary yes/no (1/0) whether patient has been diagnosed with CHD at any point before their second stroke.
+
+`race`: Subject race.
+
 
 ```{r}
-clean%>%
+cleaned%>%
   filter(TIME <7049)%>% #missing value time
   summarize(maxDays = (max(TIME)))#/30.4)/12)
 ```
@@ -180,18 +377,157 @@ clean%>%
 
 So, following these people for 20 years after their first stroke will do fine.
 
+## Analysis Goal
 
-## Competing Risk Regression
+Okay so what exactly am i doing...
+
+I want to make a model for survival time (competing risk of death should be accounted for but really isn't a huge deal in this data)
+
+So I want a model with:
+
+covariates [age, **smoking**, **diabetes**, **lvh**, chd, hypertension, **spb**]
+
+covariates [race, bmi, **cholesterol**, albumin, vWF, **pad**]
+
+both sets of covariates: [age, chd, hypertension, race, bmi, albumin, vWF]
+
+covariates [ace, cc blockers, beta blockers, diuretics, arb]
+
+all [age, chd, hypertension, race, bmi, albumin, vWF, ace, cc blockers, beta blockers, diuretics, arb]
+
+
+
+I'll need to check proportional hazards assumption for each model and I may need to use a competing risk approach, that is I could either set deaths to be censoring OR set death to be a competing risk to be evaluated separately.
+In a strange turn of events, I have 38 death times that are lower than the stroke times (after removing the ones that I defaulted up to 7049)
 
 ```{r}
-nrow(clean)
+head(cleaned)
 ```
 
 
 ```{r}
-ci_fit<-cuminc(ftime = clean$TIME,
-               fstatus = clean$status, #event 1 = stroke , event 2 = CR
-               group = clean$primary_race,
+cleaned%>%
+  filter(death_time!=7049 & stroke_2_time != 7049)%>%
+  filter(death_time < stroke_2_time)%>%
+  select(TIME, death_time, stroke_2_time)%>%
+  nrow()
+
+cleaned%>%
+  filter(stroke_2_time != 7049)%>%
+  select(TIME, death_time, stroke_2_time)%>%
+  nrow()
+```
+
+
+```{r}
+ggplot(cleaned)+
+  geom_density(aes(x=TIME))
+```
+
+```{r}
+set.seed(123)
+cleaned%>%
+  filter(status == 0)%>%
+  sample_n(10)
+
+cleaned%>%
+  filter(TIME <= 1)%>%
+  group_by(TIME)%>%
+  summarize(n=n())%>%
+  filter(n>10)
+```
+
+
+```{r}
+select<-dplyr::select
+
+cleaned2<-cleaned%>%
+  # filter(!is.na(bmi))%>%
+  #  mutate(BMI = ifelse(bmi < 18.5, "bUnderweight",
+  #                     ifelse(18.5 <= bmi & bmi < 25, "aNormal",
+  #                            ifelse(25 <= bmi & bmi < 30, "cOverweight", "dObese"))))%>%
+  mutate(age_group = factor(ifelse(ref_age < 65, "< 65", "> 65")),
+         race = as.factor(race))
+
+# cleaned2%>%
+#   group_by(age_group)%>%
+#   summarize(n=n())
+
+fit1<-coxph(Surv(TIME, ifelse(status == 1, 1, 0)) ~ BMI + strata(race) + age_group , data=cleaned2)
+
+summary(fit1)
+
+broom::tidy(fit1, exp = TRUE)
+
+```
+
+```{r}
+
+cz <- cox.zph(fit1)
+print(cz)
+plot(cz)
+```
+
+
+```{r}
+ggsurvplot(survfit(fit1),
+           data= cleaned2,
+           censor = TRUE,
+           censor.shape= 124,
+           censor.size = 1.75,
+           size = 0.75)
+
+ex <- survfit(fit1, 
+    data = cleaned2
+    )
+ggsurvplot(data = cleaned2, 
+           fit = ex,
+           xlab = "Years",
+           xscale = 365.25,
+           break.x.by = 365.25,
+           size = 0.75,
+           censor = TRUE,
+           censor.shape= 124,
+           censor.size = 1.75,
+           fun = "cumhaz",
+           legend.title = "",
+           legend = "bottom", 
+           risk.table = F,
+           risk.table.y.text = F)
+```
+
+
+```{r}
+ggsurvplot(
+    fit = survfit(Surv(TIME, status) ~ strata(race), data = cleaned2), 
+    size = 0.75,
+    censor = FALSE, #turns off the vertical tickmarks at censoring times
+    legend.labs = c("Black", "White"),
+    xlab = "Days", 
+    ylab = "Overall survival probability")+#layering works per normal gg language
+  ggtitle("Kaplan Meier")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Competing Risk Regression
+
+
+
+```{r}
+ci_fit<-cuminc(ftime = cleaned$TIME,
+               fstatus = cleaned$status, #event 1 = stroke , event 2 = CR (death)
+               group = cleaned$race,
                cencode = 0)
 ci_fit
 ci_fit[["Tests"]]
@@ -235,7 +571,7 @@ ggplot(ciplotdat, aes(x = time, y = est, color = Group)) +
                     round(ci_fit$Tests[1, 2], 3)))) + 
   annotate("text", x = 0, y = 0.92, hjust = 0,
            label = paste0(
-             "Competing Risk p = ", 
+             "Competing Risk (death) p = ", 
              ifelse(ci_fit$Tests[2, 2] < .001, 
                     "<.001", 
                     round(ci_fit$Tests[2, 2], 3)))) +
@@ -250,13 +586,45 @@ ci_fit$Tests[1, 2]
 ```
 
 
+
+
+
+
 ```{r}
-cr_Mod<- cmprsk::crr(
-  ftime= clean$TIME, #time variable
-  fstatus = clean$status, #censoring vs death vs stroke
-  cov1 = clean[, c("primary_race", "ref_age", "BMI")], # matrix of the covariates we care about from our data
-  cencode = 2 # we need to specify that if status == 2 then there person was censored, nomrally this defaults to 0
-)
+csh_1_fit <- 
+  coxph(
+    Surv(TIME, ifelse(status == 1, 1, 0)) ~ race + ref_age, 
+    data = cleaned
+    )
+
+broom::tidy(csh_1_fit, exp = TRUE)
+
+cz <- cox.zph(csh_1_fit)
+print(cz)
+plot(cz)
+```
+
+```{r}
+ex <- survfit(Surv(TIME, ifelse(status == 1, 1, 0)) ~ race + ref_age, 
+    data = cleaned
+    )
+ggsurvplot(data = cleaned, 
+           fit = ex,
+           xlab = "Months",
+           xscale = 30.4,
+           break.x.by = 182.4,
+           fun = "cumhaz",
+           legend.title = "",
+           #legend.labs = c("Male", "Female"),
+           legend = "bottom", 
+           risk.table = F,
+           risk.table.y.text = FALSE)
+```
+
+```{r}
+ggsurvplot(data = clean, 
+           fit = ex,
+           fun = "cumhaz")
 ```
 
 
@@ -264,6 +632,34 @@ cr_Mod<- cmprsk::crr(
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+LIMITATION: I do not have smoking data. When I add smoking data, MD Clone changes my output and I get no second strokes. 
+
+```{r}
+smoke_props<-read_csv("strokes_6.csv")
+colnames(smoke_props)<-str_to_lower(str_replace_all(colnames(smoke_props), "\\s|-", "_"))
+colnames(smoke_props)<-str_remove_all(colnames(smoke_props), "\\(|\\)")
+colnames(smoke_props)<-str_replace_all(colnames(smoke_props),"reference_event", "stroke_1")
+smoke_props%>%
+  group_by(smoke_tobacco_status_smoking)%>%
+  summarize(prop=round(n()/nrow(smoke_props), 4))
+```
 
 
 
