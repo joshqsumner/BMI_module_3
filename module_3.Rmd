@@ -58,99 +58,46 @@ remotes::install_github("zabore/condsurv")
 ```
 
 
-## Read in Strokes 4
+# Read In
 
 
 ```{r}
-df<-read_csv("strokes_4.csv")
-
+#df<-read_csv("strokes_4.csv")
+df<-read_csv("stroke_smoke.csv") #smoking change
 colnames(df)<-str_to_lower(str_replace_all(colnames(df), "\\s|-", "_"))
 colnames(df)<-str_replace_all(colnames(df),"reference_event", "stroke_1")
-dim(df)
+colnames(df)<-str_remove_all(colnames(df), "_\\(smoking\\)")
+df<-df%>%mutate(stroke_2 = ifelse(!is.na(stroke_2_condition_start_date_days_from_reference), 1,0))  #smoking change
 colnames(df)
 ```
 
-
-
-
-```{r}
-df%>%
-  group_by(primary_race)%>%
-  summarize(n=n())
-```
-
-
+# Check Censoring
 
 ```{r}
 df$count_censored<-apply(df,1,function(x) 
             sum(sapply("censored", function(codes) grepl("censored",x))))
-```
 
-```{r}
 list<-apply(df,2,function(x) 
             sum(sapply("censored", function(codes) grepl("censored",x))))
 sort(list, decreasing=T)%>%
   head(5)
-```
 
-```{r}
 df%>%
   mutate(ifelse(count_censored>=1, 1, 0))%>%
   group_by(count_censored>=1)%>%
   summarize(n=n())
+
+# df<-df%>%
+#   mutate(across(
+#     .cols = everything(), #maybe change this, something like starts_with("malignant"),
+#     .fns = ~ str_replace(.,"censored", "missing")
+#   ))
 ```
 
 
-```{r}
-df<-df%>%
-  mutate(across(
-    .cols = everything(), #maybe change this, something like starts_with("malignant"),
-    .fns = ~ str_replace(.,"censored", "missing")
-  ))
-```
+# Cleaning
 
-
-
-```{r}
-nonCens4 <-df%>%
-  filter(count_censored ==0)
-nrow(nonCens4)
-```
-
-```{r}
-df%>%
-  mutate(stroke_2_condition_raw = ifelse(is.na(stroke_2_condition), "None", stroke_2_condition))%>%
-  group_by(stroke_2_condition_raw)%>%
-  summarize(prop=paste0(100*round(n()/nrow(df), digits=4),"%"))
-
-nonCens4%>%
-  mutate(stroke_2_condition_cleaned = ifelse(is.na(stroke_2_condition), "None", stroke_2_condition))%>%
-  group_by(stroke_2_condition_cleaned)%>%
-  summarize(prop=paste0(100*round(n()/nrow(nonCens4), digits=4),"%"))
-```
-
-This is more acceptable censoring effect, with censoring and empty BMI values removed I am within 2% of original event rate.
-
-```{r}
-df%>%
-  filter(!is.na(bmi_average_calculated_bmi))%>%
-  nrow()
-```
-
-what columns do I need to make?
-
-Time of first stroke: 0
-
-Time from first stroke to EVENT (first of embolism, death, stroke_2)
-
-EVENT code (0 = censor, 1 = stroke_2/embolism, 2 = competing_death)
-
-```{r}
-colnames(df)
-```
-
-
-
+## Make Survival Data
 
 ```{r}
 isNeg<-function(x){ifelse(x < 0, 1, x)}
@@ -196,12 +143,12 @@ cleaned<-df%>%
     .cols = contains("_time"),
     .fns = ~ ifelse(is.na(.), 7049, .)))%>%
   mutate(bmi = ifelse(is.na(bmi), median(bmi, na.rm=T), bmi))%>%
-  mutate(BMI = ifelse(is.na(bmi), "missing",
+  mutate(BMI = ifelse(is.na(bmi), "censored", #from "missing"
                       ifelse(bmi < 18.5, "Underweight",
                       ifelse(18.5 <= bmi & bmi < 25, "Normal",
                              ifelse(25 <= bmi & bmi < 30, "Overweight", "Obese")))))%>%
   mutate(BMI = as.factor(BMI))%>%
-  select(id, race=primary_race, ref_age, bmi, TIME, status, contains("_time"), BMI, stroke_2_condition)%>%
+  select(id, race=primary_race, ref_age, bmi, TIME, status, contains("_time"), BMI, stroke_2, smoke_tobacco_status)%>% #from stroke_2_condition
   ungroup()
   
 colnames(cleaned)<-str_remove_all(colnames(cleaned), "_start_date_days_from_reference_time")
@@ -214,53 +161,58 @@ cleaned<-cleaned%>%
          HYP = ifelse(hypertension_admission < TIME, 1, 0),
          ARB = ifelse(arb_order < TIME, 1, 0),
          CHD = ifelse(chd_condition < TIME, 1, 0))%>%
-  select(id, ref_age, TIME, status, bmi, BMI, hypertension_admission, HYP, ace_inhib_order, ACE, diuretics_order, DIU, beta_blockers_order, BB, cc_blocker_order, CC, arb_order, ARB, chd_time = chd_condition, CHD, race)
-
+  mutate(smoke = ifelse(is.na(smoke_tobacco_status), "Unknown",
+                                ifelse(smoke_tobacco_status == "Unknown If Ever Smoked", "Unknown",
+                                ifelse(smoke_tobacco_status == "Never Assessed", "Unknown",
+                                ifelse(smoke_tobacco_status == "Never Smoker", "Nonsmoker",
+                                ifelse(smoke_tobacco_status == "Passive Smoke Exposure - Never Smoker", "Nonsmoker",
+                                       "Smoker"))))))%>%
+  select(id, ref_age, TIME, status, bmi, BMI, hypertension_admission, HYP, ace_inhib_order, ACE, diuretics_order, DIU, beta_blockers_order, BB, cc_blocker_order, CC, arb_order, ARB, chd_time = chd_condition, CHD, race, smoke)
 head(cleaned)
-#nrow(cleaned)
 ```
 
 
 
+### Make Time Dependent Survival Data
 
 ```{r}
 switchBinary<-function(x){-1*(x-1)}
 td<-tmerge(
-    data1 = cleaned %>% select(id, TIME, status, ref_age, BMI, bmi, race), 
+    data1 = cleaned %>% select(id, TIME, status, ref_age, BMI, bmi, race, smoke), 
     data2 = cleaned %>% select(id, TIME, status, BB, beta_blockers_order), 
     id = id, 
     stroke2 = event(TIME, status),
     beta = tdc(BB)
     )
-nrow(td)
+#nrow(td)
 td<-tmerge(
   data1 = td,
   data2 = cleaned%>%select(id, TIME, status, CC, cc_blocker_order),
   id = id,
   cc = tdc(CC)
 )
-nrow(td)
+#nrow(td)
 td<-tmerge(
   data1 = td,
   data2 = cleaned%>%select(id, TIME, status, HYP, hypertension_admission),
   id = id,
   hyp = tdc(HYP)
 )
-nrow(td)
+#nrow(td)
 td<-tmerge(
   data1 = td,
   data2 = cleaned%>%select(id, TIME, status, ACE, ace_inhib_order),
   id = id,
   ace = tdc(ACE)
 )
-nrow(td)
+#nrow(td)
 td<-tmerge(
   data1 = td,
   data2 = cleaned%>%select(id, TIME, status, ARB, arb_order),
   id = id,
   arb = tdc(ARB)
 )
-nrow(td)
+#nrow(td)
 td<-tmerge(
   data1 = td,
   data2 = cleaned%>%select(id, TIME, status, CHD, chd_time),
@@ -271,49 +223,16 @@ td<-td%>%
   mutate(across(
     .cols = c(beta, cc, hyp, ace, arb, chd),
     .fns = ~switchBinary(.)
+  ))%>%
+  mutate(across(
+    .cols = c(BMI, race, smoke, beta, cc, hyp, ace, arb, chd),
+    .fns = ~as.factor(.)
   ))
-
-nrow(td)
-head(td)
 ```
 
+# Data Dictionary
 
-```{r}
-td%>%
-  filter(chd==1)%>%
-  nrow()
-cleaned%>%
-  filter(CHD==1)%>%
-  nrow()
-```
-
-
-```{r}
-tdcxph<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ ref_age+chd + hyp, data = td)
-
-tdcxph %>% broom::tidy(exp=T)
-summary(tdcxph)
-cox.zph(tdcxph)
-```
-
-```{r}
-tdcxph2<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ beta+cc+arb+ace+BMI+race, data = td)
-
-tdcxph2 %>% broom::tidy(exp=T)
-summary(tdcxph2)
-cox.zph(tdcxph2)
-```
-
-```{r}
-tdcxph3<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ ref_age+chd +BMI+race, data = td)
-
-tdcxph3 %>% broom::tidy(exp=T)
-summary(tdcxph3)
-cox.zph(tdcxph3)
-```
-
-These drug details are pretty worthless, I'll probably rebuild a new MD Clone query and see if I can get smoking status without everything getting messed up.
-
+## Cleaned
 
 `cleaned` Data:
 
@@ -365,126 +284,176 @@ missing: bmi was not found
 
 `CHD`: Binary yes/no (1/0) whether patient has been diagnosed with CHD at any point before their second stroke.
 
+`smoke`: Smoking status reduced to 3 levels, unknown, smoker, and nonsmoker.
+
 `race`: Subject race.
 
+## TD
+
+`td` Data:
+
+`id`: Row identifier for unique simulated subjects, subjects may have multiple rows of data if their time dependent variables changed during their time 'on the study'.
+
+`ref_age`: Age at first stroke
+
+`TIME`: Time to second stroke in days. When a time was not present this defaults to 7049.
+
+`status`: 
+status = 0 : censored
+status = 1 : stroke
+status = 2 : Death by competing risk
+
+`bmi`: Numeric BMI
+
+`BMI`: Discretized BMI
+Underweight: bmi under 18.5
+Normal: bmi between 18.5 and 25
+Overweight: bmi between 25 and 30
+Obese: bmi over 30
+missing: bmi was not found
+
+`race`: Subject race.
+
+`smoke`: Smoking status reduced to 3 levels, unknown, smoker, and nonsmoker.
+
+`tstart`: Start of timeframe for patient with given set of time dependent covariates
+
+`tstop`: Stop of timeframe for the patient with given set of time dependent covariates
+
+`stroke2`: Binary whether event occured during this timeframe for this patient
+
+`beta`: Binary whether or not whether subject had beta blockers in this timeframe
+
+`cc`: Binary whether or not whether subject had calcium channel blockers in this timeframe
+
+`hyp`: Binary whether or not whether subject had diagnosed hypertension in this timeframe
+
+`ace`: Binary whether or not whether subject had ace inhibitors in this timeframe
+
+`arb`: Binary whether or not whether subject had agents acting on renin-angiotensin system in this timeframe
+
+`chd`: Binary whether or not whether subject had CHD in this timeframe
+
+
+# Models
 
 ```{r}
-cleaned%>%
-  filter(TIME <7049)%>% #missing value time
-  summarize(maxDays = (max(TIME)))#/30.4)/12)
-```
-
-
-So, following these people for 20 years after their first stroke will do fine.
-
-## Analysis Goal
-
-Okay so what exactly am i doing...
-
-I want to make a model for survival time (competing risk of death should be accounted for but really isn't a huge deal in this data)
-
-So I want a model with:
-
-covariates [age, **smoking**, **diabetes**, **lvh**, chd, hypertension, **spb**]
-
-covariates [race, bmi, **cholesterol**, albumin, vWF, **pad**]
-
-both sets of covariates: [age, chd, hypertension, race, bmi, albumin, vWF]
-
-covariates [ace, cc blockers, beta blockers, diuretics, arb]
-
-all [age, chd, hypertension, race, bmi, albumin, vWF, ace, cc blockers, beta blockers, diuretics, arb]
-
-
-
-I'll need to check proportional hazards assumption for each model and I may need to use a competing risk approach, that is I could either set deaths to be censoring OR set death to be a competing risk to be evaluated separately.
-In a strange turn of events, I have 38 death times that are lower than the stroke times (after removing the ones that I defaulted up to 7049)
-
-```{r}
-head(cleaned)
-```
-
-
-```{r}
-cleaned%>%
-  filter(death_time!=7049 & stroke_2_time != 7049)%>%
-  filter(death_time < stroke_2_time)%>%
-  select(TIME, death_time, stroke_2_time)%>%
-  nrow()
-
-cleaned%>%
-  filter(stroke_2_time != 7049)%>%
-  select(TIME, death_time, stroke_2_time)%>%
-  nrow()
-```
-
-
-```{r}
-ggplot(cleaned)+
-  geom_density(aes(x=TIME))
-```
-
-```{r}
-set.seed(123)
-cleaned%>%
-  filter(status == 0)%>%
-  sample_n(10)
-
-cleaned%>%
-  filter(TIME <= 1)%>%
-  group_by(TIME)%>%
-  summarize(n=n())%>%
-  filter(n>10)
+td%>%
+  group_by(hyp, stroke2)%>%
+  summarize(n=n())
 ```
 
 
 ```{r}
-select<-dplyr::select
+tdnd<-td%>%
+  mutate(age_group = factor(ifelse(ref_age < 45, "<45",
+                            ifelse(ref_age<60, "<60",
+                            ifelse(ref_age <75, "<75", 
+                                   ">75")))))%>%
+  mutate(stroke2=ifelse(stroke2 %in% c(1,2), 1,0)) #stroke or death = 1, censor = 0
 
-cleaned2<-cleaned%>%
-  # filter(!is.na(bmi))%>%
-  #  mutate(BMI = ifelse(bmi < 18.5, "bUnderweight",
-  #                     ifelse(18.5 <= bmi & bmi < 25, "aNormal",
-  #                            ifelse(25 <= bmi & bmi < 30, "cOverweight", "dObese"))))%>%
-  mutate(age_group = factor(ifelse(ref_age < 65, "< 65", "> 65")),
-         race = as.factor(race))
+tdcxph<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ age_group+smoke+hyp+chd, data = tdnd)
 
-# cleaned2%>%
-#   group_by(age_group)%>%
-#   summarize(n=n())
-
-fit1<-coxph(Surv(TIME, ifelse(status == 1, 1, 0)) ~ BMI + strata(race) + age_group , data=cleaned2)
-
-summary(fit1)
-
-broom::tidy(fit1, exp = TRUE)
-
-```
-
-```{r}
-
-cz <- cox.zph(fit1)
-print(cz)
-plot(cz)
-```
-
-
-```{r}
-ggsurvplot(survfit(fit1),
-           data= cleaned2,
-           censor = TRUE,
+tdcxph %>% broom::tidy(exp=T)
+s<-summary(tdcxph)
+conc<-s$concordance[1]
+assumption<-cox.zph(tdcxph)
+assumption
+aic1<-extractAIC(tdcxph)
+aic1
+plotMod1<-ggsurvplot(survfit(tdcxph),
+           data= tdnd,
+           censor = F,
            censor.shape= 124,
            censor.size = 1.75,
-           size = 0.75)
+           title = "Model 1 (Classic Covariates)",
+           size = 0.75,
+           legend="none")
+plotMod1$plot<-plotMod1$plot+
+  ggplot2::annotate("label", x=2000, y=0.25, label=paste0("Concordance: ", round(conc, 4), "\n AIC:", round(aic1[2], 2)))
+plotMod1
+ggsave("mod_1.png", width = 6, height=4)
+```
 
-ex <- survfit(fit1, 
-    data = cleaned2
-    )
-ggsurvplot(data = cleaned2, 
-           fit = ex,
+
+
+```{r}
+tdcxph2<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ beta+cc+arb+ace+BMI+strata(race), data = tdnd)
+
+tdcxph2 %>% broom::tidy(exp=T)
+s<-summary(tdcxph2)
+conc2<-s$concordance[1]
+cox.zph(tdcxph2)
+aic2<-extractAIC(tdcxph2)
+aic2
+plotMod2<-ggsurvplot(survfit(tdcxph2),
+           data= tdnd,
+           censor = F,
+           censor.shape= 124,
+           censor.size = 1.75,
+           title = "Model 2 (New Covariates)",
+           size = 0.75,
+           legend="top")
+plotMod2$plot<-plotMod2$plot+
+  ggplot2::annotate("label", x=2000, y=0.25, label=paste0("Concordance: ", round(conc2, 4), "\n AIC:", round(aic2[2],2)))
+plotMod2
+ggsave("mod_2.png", width = 6, height=4)
+```
+
+```{r}
+tdcxph3<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ age_group+strata(race)+BMI+beta+cc+ace+arb+smoke+chd, data = tdnd)
+# age_group + race + BMI + beta + cc + arb + ace + smoke + chd
+
+#tdcxph3 %>% broom::tidy(exp=T)
+s<-summary(tdcxph3)
+conc3<-s$concordance[1]
+#cox.zph(tdcxph3)
+aic3<-extractAIC(tdcxph3)
+aic3
+plotMod3<-ggsurvplot(survfit(tdcxph3),
+           data= tdnd,
+           censor = F,
+           censor.shape= 124,
+           censor.size = 1.75,
+           title = "Model 3 (Combination)",
+           size = 0.75,
+           legend="top")
+plotMod3$plot<-plotMod3$plot+
+  ggplot2::annotate("label", x=2000, y=0.25, label=paste0("Concordance: ", round(conc3, 4), "\n AIC:", round(aic3[2],2)))
+plotMod3
+ggsave("mod_3.png", width = 6, height=4)
+```
+
+```{r}
+anova(tdcxph, tdcxph2, tdcxph3)
+```
+
+
+
+```{r}
+fit <- list(Original = survfit(tdcxph), New = survfit(tdcxph2), Mixture = survfit(tdcxph3))
+```
+
+
+```{r, fig.height=6}
+graph<-ggsurvplot(fit=fit,
+           data = tdnd,
+           combine = TRUE,
+           censor = FALSE,
+           title = "Survival Curves of All Models",
+           tables.theme = theme_cleantable(),  # Clean risk table
+           palette = "jco")
+
+ggsave("combined_models_tab.png", height=2, width=7)
+```
+
+
+```{r, fig.height=8, fig.width = 9}
+ggsurvplot(data = tdnd, 
+           fit = survfit(tdcxph3),
            xlab = "Years",
            xscale = 365.25,
-           break.x.by = 365.25,
+           break.x.by = 730.5,
            size = 0.75,
            censor = TRUE,
            censor.shape= 124,
@@ -492,20 +461,70 @@ ggsurvplot(data = cleaned2,
            fun = "cumhaz",
            legend.title = "",
            legend = "bottom", 
-           risk.table = F,
-           risk.table.y.text = F)
+           risk.table = T,
+           risk.table.y.text = T)
 ```
+
+
+
+# Time Dependent AUC
+
+Run this at your own risk, it seems to be RAM heavy
+
+```{r, eval=F}
+install.packages('survAUC')
+```
+
+```{r, eval=F, echo=F}
+library(survAUC)
+```
+
+```{r, eval=F, echo=F}
+rio::export(cleaned, "cleaned_strokes.csv")
+rio::export(tdnd, "time_dependent.csv")
+```
+
+```{r, eval=F, echo=F}
+cleanedcsv<-read_csv("cleaned_strokes.csv")
+set.seed(987)
+cleaned_train<-cleanedcsv%>%
+  slice_sample(prop = 0.75)
+
+cleaned_test<-anti_join(cleanedcsv, cleaned_train)
+
+
+
+
+cxphT1<-coxph(Surv(time = TIME, event = status) ~ ref_age+smoke+HYP+CHD+race+bmi, data = cleaned_train)
+
+# tdcxphT3<-coxph(Surv(time = tstart, time2 = tstop, event = stroke2) ~ age_group+strata(race)+BMI+beta+cc+ace+arb+smoke+chd, data = tdnd_train)
+
+pred1<-predict(cxphT1)
+pred2<-predict(cxphT1, newdata=cleaned_test)
+
+Surv.rsp<-Surv(cleaned_train$TIME, cleaned_train$status)
+Surv.rsp.new<-Surv(cleaned_test$TIME, cleaned_test$status)
+
+times <- seq(0, 8000, 100)
+
+AUC_CD <- AUC.cd(Surv.rsp, Surv.rsp.new, pred1, pred2, times)
+
+AUC_CD
+```
+
+
+
 
 
 ```{r}
 ggsurvplot(
-    fit = survfit(Surv(TIME, status) ~ strata(race), data = cleaned2), 
+    fit = survfit(Surv(TIME, status) ~ strata(race), data = cleaned), 
     size = 0.75,
     censor = FALSE, #turns off the vertical tickmarks at censoring times
     legend.labs = c("Black", "White"),
     xlab = "Days", 
     ylab = "Overall survival probability")+#layering works per normal gg language
-  ggtitle("Kaplan Meier")
+  ggtitle("Kaplan Meier Curve")
 ```
 
 
@@ -562,7 +581,7 @@ ggplot(ciplotdat, aes(x = time, y = est, color = Group)) +
   ylim(c(0, 1))+
   labs(x = "Days", 
        y = "Cumulative incidence",
-       title = "Stroke/Death by Race") +
+       title = "Stroke and Death by Race") +
   annotate("text", x = 0, y = 1, hjust = 0,
            label = paste0(
              "Stroke p = ", 
@@ -571,7 +590,7 @@ ggplot(ciplotdat, aes(x = time, y = est, color = Group)) +
                     round(ci_fit$Tests[1, 2], 3)))) + 
   annotate("text", x = 0, y = 0.92, hjust = 0,
            label = paste0(
-             "Competing Risk (death) p = ", 
+             "Competing Risk (Death) p = ", 
              ifelse(ci_fit$Tests[2, 2] < .001, 
                     "<.001", 
                     round(ci_fit$Tests[2, 2], 3)))) +
@@ -579,14 +598,8 @@ ggplot(ciplotdat, aes(x = time, y = est, color = Group)) +
   theme(plot.title = element_text(size = 14),
         legend.title = element_blank(),
         legend.position = "bottom") 
+ggsave("competing_risks.png", width=6, height=4)
 ```
-
-```{r}
-ci_fit$Tests[1, 2]
-```
-
-
-
 
 
 
@@ -604,63 +617,19 @@ print(cz)
 plot(cz)
 ```
 
-```{r}
-ex <- survfit(Surv(TIME, ifelse(status == 1, 1, 0)) ~ race + ref_age, 
-    data = cleaned
-    )
-ggsurvplot(data = cleaned, 
-           fit = ex,
-           xlab = "Months",
-           xscale = 30.4,
-           break.x.by = 182.4,
-           fun = "cumhaz",
-           legend.title = "",
-           #legend.labs = c("Male", "Female"),
-           legend = "bottom", 
-           risk.table = F,
-           risk.table.y.text = FALSE)
-```
+## Citations
 
 ```{r}
-ggsurvplot(data = clean, 
-           fit = ex,
-           fun = "cumhaz")
+citation("dplyr")
+citation("survival")
+citation("cmprsk")
+citation("survAUC")
 ```
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-LIMITATION: I do not have smoking data. When I add smoking data, MD Clone changes my output and I get no second strokes. 
-
 ```{r}
-smoke_props<-read_csv("strokes_6.csv")
-colnames(smoke_props)<-str_to_lower(str_replace_all(colnames(smoke_props), "\\s|-", "_"))
-colnames(smoke_props)<-str_remove_all(colnames(smoke_props), "\\(|\\)")
-colnames(smoke_props)<-str_replace_all(colnames(smoke_props),"reference_event", "stroke_1")
-smoke_props%>%
-  group_by(smoke_tobacco_status_smoking)%>%
-  summarize(prop=round(n()/nrow(smoke_props), 4))
+sessionInfo()
 ```
-
 
 
 
